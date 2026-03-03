@@ -224,7 +224,42 @@ def score_candidate(
     radii: Tuple[int, int, int],
 ) -> Tuple[float, Dict[str, float], Dict[str, str], List[str]]:
     reasons: List[str] = []
-    # 维度基础分
+    group_labels = {
+        "express": "快递/自提",
+        "food": "餐饮",
+        "sanitation": "环卫/垃圾",
+        "parking_charging": "停车/充电",
+        "community_service": "社区/党群",
+        "school": "学校/幼儿园",
+        "park_office": "园区/办公",
+        "commerce": "商业",
+        "residence_property": "物业/小区",
+        "gate": "门岗/出入口",
+        "express_point": "快递点",
+        "trash_point": "垃圾点",
+        "parking": "停车口",
+    }
+    a_order = ["express", "food", "sanitation", "parking_charging", "community_service"]
+    b_order = ["school", "park_office", "commerce", "residence_property"]
+    c_order = ["gate", "express_point", "trash_point", "parking"]
+
+    def pick_examples(groups: Iterable[str]) -> List[str]:
+        examples: List[str] = []
+        seen: set = set()
+        for g in groups:
+            if g in seen:
+                continue
+            seen.add(g)
+            candidates = [h for h in hits if h.get("group") == g and h.get("name")]
+            if not candidates:
+                continue
+            candidates.sort(key=lambda x: x.get("distance") if x.get("distance") is not None else 1e9)
+            sample = candidates[0]
+            dist_val = sample.get("distance")
+            dist_str = f"@{int(dist_val)}m" if dist_val is not None else ""
+            examples.append(f"{group_labels.get(g, g)}: {sample.get('name', '')}{dist_str}")
+        return examples
+
     score_nodes = 1 + min(len(present["A"]), 4)
     score_mix = 1 + min(len(present["B"]), 4)
     core_hits = [h for h in hits if h["radius"] <= radii[0]]
@@ -234,7 +269,6 @@ def score_candidate(
     score_eval = 1 if not eval_candidates else min(5, 2 + len(eval_candidates))
     entry_clue = [h for h in hits if h["group"] in ("community_service", "residence_property")]
     score_entry = 1 if not entry_clue else min(5, 3 + min(len(entry_clue), 2))
-    # 边界清晰度粗略：住宅+停车+出入口数量
     gate_like = [h for h in hits if h["group"] in ("gate", "parking")]
     if len(gate_like) >= 3:
         score_boundary = 5
@@ -245,8 +279,6 @@ def score_candidate(
     else:
         score_boundary = 2 if present["B"] else 1
 
-    # 权重
-    # 维度原始分（每项 1–5 分），按用户要求：总分为各维度直接求和
     raw_total = (
         score_nodes
         + score_boundary
@@ -256,9 +288,8 @@ def score_candidate(
         + score_entry
     )
 
-    # 硬淘汰判定
     if len(present["A"]) == 0:
-        reasons.append("A 类高频节点缺失（快递/餐饮/垃圾/停车/社区服务均未命中）")
+        reasons.append("A 类高频节点缺失（快递/餐饮/环卫/停车/社区服务均未命中）")
     if score_boundary <= 1:
         reasons.append("边界极不清晰")
     if score_entry == 1:
@@ -266,13 +297,20 @@ def score_candidate(
 
     final_total = 0 if reasons else raw_total
 
+    a_examples = pick_examples([g for g in a_order if g in present["A"]])
+    b_examples = pick_examples([g for g in b_order if g in present["B"]])
+    c_examples = pick_examples([g for g in c_order if any(h["group"] == g for h in c_core)])
+    boundary_examples = pick_examples([g for g in ("gate", "parking") if any(h["group"] == g for h in gate_like)])
+    eval_examples = pick_examples([g for g in c_order if any(h["group"] == g for h in eval_candidates)])
+    entry_examples = pick_examples([g for g in ("community_service", "residence_property") if any(h["group"] == g for h in entry_clue)])
+
     details = {
-        "节点完整度": f"A类命中 {len(present['A'])} 种，得分 {score_nodes}/5",
-        "边界清晰": f"门岗/停车数量 {len(gate_like)} 个，得分 {score_boundary}/5",
-        "角色混合度": f"B类命中 {len(present['B'])} 种，得分 {score_mix}/5",
-        "试点可行": f"C类核心半径内 {len(c_core)} 个，得分 {score_pilot}/5",
-        "可评估性": f"可评估点 {len(eval_candidates)} 个，得分 {score_eval}/5",
-        "进入性": f"物业/居委线索 {len(entry_clue)} 条，得分 {score_entry}/5",
+        "节点完整度": f"A类命中 {len(present['A'])} 种，得分 {score_nodes}/5；命中示例：{'; '.join(a_examples) if a_examples else '暂无'}",
+        "边界清晰": f"门岗/停车命中 {len(gate_like)} 个，得分 {score_boundary}/5；命中示例：{'; '.join(boundary_examples) if boundary_examples else '暂无'}",
+        "角色混合度": f"B类命中 {len(present['B'])} 种，得分 {score_mix}/5；命中示例：{'; '.join(b_examples) if b_examples else '暂无'}",
+        "试点可行": f"C类核心半径内 {len(c_core)} 个，得分 {score_pilot}/5；命中示例：{'; '.join(c_examples) if c_examples else '暂无'}",
+        "可评估性": f"可评估点 {len(eval_candidates)} 个，得分 {score_eval}/5；命中示例：{'; '.join(eval_examples) if eval_examples else '暂无'}",
+        "进入性": f"物业/居委线索 {len(entry_clue)} 条，得分 {score_entry}/5；命中示例：{'; '.join(entry_examples) if entry_examples else '暂无'}",
     }
 
     return final_total, {
