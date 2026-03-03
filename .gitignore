@@ -8,8 +8,8 @@ env/
 .idea/
 .vscode/
 
-# Local data outputs
-candidates.sqlite
+# Local data outputs（需要提交时请移除对应规则）
+# report.csv 仍默认忽略，数据库文件放行
 report.csv
 
 # OS/Editor backups
