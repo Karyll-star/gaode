@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 from urllib.parse import parse_qs, urlparse
 
+NUMERIC_TYPE_TOKENS = ("INT", "REAL", "FLOA", "DOUB", "NUM", "DEC")
+
 
 HTML_PAGE = """<!doctype html>
 <html lang="zh-CN">
@@ -170,6 +172,32 @@ HTML_PAGE = """<!doctype html>
     .search {
       display: grid; gap: 6px;
     }
+    td.editable-number {
+      cursor: text;
+      text-decoration: underline dotted rgba(56, 189, 248, 0.5);
+      text-underline-offset: 3px;
+    }
+    td.editable-number:hover {
+      background: rgba(16, 185, 129, 0.14);
+    }
+    .inline-edit {
+      width: 100%;
+      padding: 4px 6px;
+      border-radius: 6px;
+      border: 1px solid rgba(56, 189, 248, 0.6);
+      background: rgba(15,23,42,0.95);
+      color: var(--text);
+      font-size: 13px;
+      outline: none;
+    }
+    .pill.ok {
+      border-color: rgba(16, 185, 129, 0.5);
+      color: #86efac;
+    }
+    .pill.err {
+      border-color: rgba(248, 113, 113, 0.55);
+      color: #fca5a5;
+    }
   </style>
 </head>
 <body>
@@ -214,6 +242,8 @@ HTML_PAGE = """<!doctype html>
         <div class="meta">
           <span class="pill" id="meta"></span>
           <span class="pill" id="tableCount"></span>
+          <span class="pill" id="editHint">双击数值单元格可编辑；Enter 保存，Esc 取消</span>
+          <span class="pill" id="editStatus">编辑就绪</span>
         </div>
       </div>
     </div>
@@ -232,6 +262,7 @@ HTML_PAGE = """<!doctype html>
     let lastColumns = [];
     let lastRows = [];
     let selectedTargetId = null;
+    let editableNumericCols = new Set();
 
     const friendly = { targets: "候选点", poi_hits: "POI命中", scores: "评分" };
     const tableSelect = document.getElementById("tableSelect");
@@ -244,6 +275,7 @@ HTML_PAGE = """<!doctype html>
     const tbody = document.querySelector("#dataTable tbody");
     const rankGrid = document.getElementById("rankGrid");
     const summaryMeta = document.getElementById("summaryMeta");
+    const editStatus = document.getElementById("editStatus");
 
     async function fetchJson(url) {
       const res = await fetch(url);
@@ -251,6 +283,102 @@ HTML_PAGE = """<!doctype html>
         throw new Error("HTTP " + res.status);
       }
       return await res.json();
+    }
+
+    async function postJson(url, payload) {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.error || ("HTTP " + res.status));
+      }
+      return data;
+    }
+
+    function setEditStatus(msg, kind) {
+      editStatus.textContent = msg;
+      editStatus.classList.remove("ok", "err");
+      if (kind) {
+        editStatus.classList.add(kind);
+      }
+    }
+
+    function isEditableNumericCell(row, col) {
+      if (!editableNumericCols.has(col)) return false;
+      const rid = row.__rowid__;
+      return Number.isInteger(rid) || (typeof rid === "number" && Number.isFinite(rid));
+    }
+
+    async function submitNumericUpdate(table, rowid, column, value) {
+      return await postJson("/api/update-cell", { table, rowid, column, value });
+    }
+
+    function startInlineEdit(td, row, col) {
+      if (td.dataset.editing === "1") return;
+      const oldText = row[col] === null || row[col] === undefined ? "" : String(row[col]);
+      const input = document.createElement("input");
+      input.type = "text";
+      input.className = "inline-edit";
+      input.value = oldText;
+      td.dataset.editing = "1";
+      td.innerHTML = "";
+      td.appendChild(input);
+      input.focus();
+      input.select();
+
+      const restore = (text) => {
+        delete td.dataset.editing;
+        td.innerHTML = "";
+        td.textContent = text;
+      };
+
+      const cancel = () => {
+        restore(oldText);
+        setEditStatus("已取消编辑");
+      };
+
+      const commit = async () => {
+        const rawValue = input.value.trim();
+        if (rawValue === oldText) {
+          restore(oldText);
+          return;
+        }
+        try {
+          const payloadValue = rawValue === "" ? null : rawValue;
+          const data = await submitNumericUpdate(tableSelect.value, row.__rowid__, col, payloadValue);
+          row[col] = data.value;
+          const newText = data.value === null || data.value === undefined ? "" : String(data.value);
+          restore(newText);
+          setEditStatus(`已更新 ${col} = ${newText}`, "ok");
+          if (tableSelect.value === "scores") {
+            const summary = await fetchJson("/api/summary").catch(() => ({ items: [] }));
+            renderRank(summary.items || []);
+          }
+        } catch (err) {
+          restore(oldText);
+          setEditStatus(`更新失败: ${err.message}`, "err");
+        }
+      };
+
+      input.addEventListener("keydown", async (ev) => {
+        if (ev.key === "Escape") {
+          ev.preventDefault();
+          cancel();
+          return;
+        }
+        if (ev.key === "Enter") {
+          ev.preventDefault();
+          await commit();
+        }
+      });
+      input.addEventListener("blur", () => {
+        if (td.dataset.editing === "1") {
+          cancel();
+        }
+      });
     }
 
     function renderTable(columns, rows) {
@@ -273,6 +401,11 @@ HTML_PAGE = """<!doctype html>
           const td = document.createElement("td");
           const val = row[col];
           td.textContent = val === null ? "" : String(val);
+          if (isEditableNumericCell(row, col)) {
+            td.classList.add("editable-number");
+            td.title = "双击编辑数值";
+            td.addEventListener("dblclick", () => startInlineEdit(td, row, col));
+          }
           tr.appendChild(td);
         }
         tbody.appendChild(tr);
@@ -392,6 +525,7 @@ HTML_PAGE = """<!doctype html>
       const pageSize = Math.max(1, Math.min(200, Number(pageSizeInput.value || "50")));
       const targetParam = selectedTargetId ? `&target_id=${selectedTargetId}` : "";
       const data = await fetchJson(`/api/table?name=${encodeURIComponent(table)}&page=${currentPage}&page_size=${pageSize}${targetParam}`);
+      editableNumericCols = new Set(data.editable_numeric_columns || []);
       totalPages = Math.max(1, Math.ceil(data.total / data.page_size));
       currentPage = data.page;
       renderTable(data.columns, data.rows);
@@ -489,9 +623,36 @@ class SQLiteViewerHandler(BaseHTTPRequestHandler):
         ).fetchall()
         out: List[Tuple[str, int]] = []
         for (name,) in rows:
-            count = conn.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0]
+            count = conn.execute(f"SELECT COUNT(*) FROM {self._quote_ident(name)}").fetchone()[0]
             out.append((name, int(count)))
         return out
+
+    def _quote_ident(self, name: str) -> str:
+        return '"' + name.replace('"', '""') + '"'
+
+    def _table_info(self, conn: sqlite3.Connection, table_name: str) -> List[Tuple[Any, ...]]:
+        return conn.execute(f"PRAGMA table_info({self._quote_ident(table_name)})").fetchall()
+
+    def _numeric_columns(self, table_info: List[Tuple[Any, ...]]) -> List[str]:
+        out: List[str] = []
+        for row in table_info:
+            col_name = str(row[1])
+            col_type = str(row[2] or "").upper()
+            is_primary_key = int(row[5] or 0) > 0
+            if is_primary_key:
+                continue
+            if any(token in col_type for token in NUMERIC_TYPE_TOKENS):
+                out.append(col_name)
+        return out
+
+    def _parse_numeric_value(self, raw_value: Any, col_type: str) -> Any:
+        if raw_value is None or raw_value == "":
+            return None
+        text = str(raw_value).strip()
+        upper_type = col_type.upper()
+        if "INT" in upper_type and "POINT" not in upper_type:
+            return int(text)
+        return float(text)
 
     def _summary(self, conn: sqlite3.Connection) -> List[Dict[str, Any]]:
         sql = """
@@ -566,23 +727,31 @@ class SQLiteViewerHandler(BaseHTTPRequestHandler):
                         self._write_json({"error": "unknown table"}, status=400)
                         return
 
-                    columns = [r[1] for r in conn.execute(f'PRAGMA table_info("{name}")').fetchall()]
+                    table_info = self._table_info(conn, name)
+                    columns = [r[1] for r in table_info]
+                    editable_numeric_columns = [c for c in self._numeric_columns(table_info)]
                     where_clause = ""
                     params: Tuple[Any, ...] = ()
                     if target_id_val is not None and "target_id" in columns:
                         where_clause = " WHERE target_id = ? "
                         params = (int(target_id_val),)
-                    total = int(conn.execute(f'SELECT COUNT(*) FROM "{name}"{where_clause}', params).fetchone()[0])
+                    table_ident = self._quote_ident(name)
+                    total = int(conn.execute(f"SELECT COUNT(*) FROM {table_ident}{where_clause}", params).fetchone()[0])
                     offset = (page - 1) * page_size
                     rows = conn.execute(
-                        f'SELECT * FROM "{name}"{where_clause} LIMIT ? OFFSET ?',
+                        f"SELECT rowid, * FROM {table_ident}{where_clause} LIMIT ? OFFSET ?",
                         params + (page_size, offset),
                     ).fetchall()
-                    dict_rows = [dict(zip(columns, row)) for row in rows]
+                    dict_rows = []
+                    for row in rows:
+                        item = dict(zip(columns, row[1:]))
+                        item["__rowid__"] = row[0]
+                        dict_rows.append(item)
                 self._write_json(
                     {
                         "name": name,
                         "columns": columns,
+                        "editable_numeric_columns": editable_numeric_columns,
                         "total": total,
                         "page": page,
                         "page_size": page_size,
@@ -594,6 +763,68 @@ class SQLiteViewerHandler(BaseHTTPRequestHandler):
             return
 
         self._write_json({"error": "not found"}, status=404)
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        if parsed.path != "/api/update-cell":
+            self._write_json({"error": "not found"}, status=404)
+            return
+
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        body = self.rfile.read(length) if length > 0 else b""
+        try:
+            payload = json.loads(body.decode("utf-8") or "{}")
+        except Exception:
+            self._write_json({"error": "invalid json"}, status=400)
+            return
+
+        table = str(payload.get("table") or "").strip()
+        column = str(payload.get("column") or "").strip()
+        rowid_raw = payload.get("rowid")
+        raw_value = payload.get("value")
+        if not table or not column or rowid_raw is None:
+            self._write_json({"error": "table/column/rowid required"}, status=400)
+            return
+
+        try:
+            rowid = int(rowid_raw)
+        except Exception:
+            self._write_json({"error": "invalid rowid"}, status=400)
+            return
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                tables = {t[0] for t in self._list_tables(conn)}
+                if table not in tables:
+                    self._write_json({"error": "unknown table"}, status=400)
+                    return
+
+                table_info = self._table_info(conn, table)
+                info_by_col = {str(r[1]): r for r in table_info}
+                if column not in info_by_col:
+                    self._write_json({"error": "unknown column"}, status=400)
+                    return
+
+                col_type = str(info_by_col[column][2] or "")
+                if not any(token in col_type.upper() for token in NUMERIC_TYPE_TOKENS):
+                    self._write_json({"error": "column is not numeric"}, status=400)
+                    return
+
+                try:
+                    value = self._parse_numeric_value(raw_value, col_type)
+                except Exception:
+                    self._write_json({"error": "invalid numeric value"}, status=400)
+                    return
+
+                sql = f"UPDATE {self._quote_ident(table)} SET {self._quote_ident(column)} = ? WHERE rowid = ?"
+                cur = conn.execute(sql, (value, rowid))
+                conn.commit()
+                if cur.rowcount == 0:
+                    self._write_json({"error": "row not found"}, status=404)
+                    return
+                self._write_json({"ok": True, "table": table, "column": column, "rowid": rowid, "value": value})
+        except Exception as exc:
+            self._write_json({"error": str(exc)}, status=500)
 
 
 def main() -> None:

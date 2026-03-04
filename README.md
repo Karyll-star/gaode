@@ -26,7 +26,7 @@ UTF-8 或 UTF-8-BOM 均可，示例见仓库。字段：
 - `半径_核心米`、`半径_扩展米`、`备注`（可选，半径可覆盖默认值）
 
 ## 快速开始
-1) 准备 Key：`export AMAP_KEY=你的高德Key`（Windows 用 `set`）。
+1) 准备 Key：`export AMAP_KEY=你的高德Key`（Windows 用 `set`）/$env:AMAP_KEY='key'。
 2) 运行评估：
 ```bash
 python pipeline.py --input candidates.csv --db candidates.sqlite --report report.csv --mode direct
@@ -49,14 +49,34 @@ python pipeline.py --input candidates.csv --db candidates.sqlite --report report
 python sqlite_web_viewer.py --db candidates.sqlite --host 127.0.0.1 --port 8000
 ```
 浏览器打开 `http://127.0.0.1:8000` 可排序、分页、按目标筛选并导出当前页 CSV。
+支持在表格中双击“数值单元格”进行行内编辑（Enter 保存、Esc 取消），改动会直接写回 SQLite。
 
-## 评分与淘汰概览（依据《量化与淘汰标准.md》）
-- 六维各 1–5 分，权重：节点完整度 15%、边界清晰 15%、角色混合 15%、试点可行 25%、可评估性 20%、进入性 10%；总分为加权和。
-- 硬淘汰：A 类高频事务节点全缺；边界极不清晰；进入性=1 且无法补充联系方式/入口线索。
-- 典型信号：
-  - A 类：快递/自提、餐饮密度、环卫/垃圾、停车/充电、社区服务。
-  - B 类：学校/园区/商业、物业或住宅信息。
-  - C 类：门岗/出入口、快递点、垃圾点、停车口（≤核心半径更优）。
+## 评分与淘汰规则明细（依据《量化与淘汰标准.md》，按当前 `pipeline.py` 实现）
+当前总分计算权重：节点完整度 15%、边界清晰 15%、角色混合度 15%、试点可行 25%、可评估性 20%、进入性 10%。
+
+当前程序统计口径（`hits`/`present`）：
+- `hits`：命中 POI 明细（按分类、子类、半径逐次检索后的记录列表）。
+- `present`：每个大类（A/B/C）命中的“子类集合”（用于统计命中种类数）。
+- 核心半径：默认 `200m`，可由 `--core-radius` 或 CSV 列 `半径_核心米` 覆盖。
+
+| 维度 | 统计方式 | 分值规则（1–5） | 备注 |
+|---|---|---|---|
+| 节点完整度 | `len(present["A"])`（A 类命中子类数） | `1 + min(命中子类数, 4)`；即 0→1、1→2、2→3、3→4、≥4→5 | A 类：`express`/`food`/`sanitation`/`parking_charging`/`community_service` |
+| 边界清晰 | `core_hits` 去重后统计切割线索数（主干道/商超/学校） | 满分 5 分减分制：`score = max(1, 5 - min(切割线索数, 4))` | 主干道：`typecode` 以 `1903` 开头或名称含“路/大道/高架”等；商超：`commerce` 且名称含“超市/商场”等；学校：`school` |
+| 角色混合度 | `len(present["B"])`（B 类命中子类数） | `1 + min(命中子类数, 4)`；即 0→1、1→2、2→3、3→4、≥4→5 | B 类：`school`/`park_office`/`commerce`/`residence_property` |
+| 试点可行 | `c_core`：核心半径内且 `category=="C"` 的命中记录数 | `0→1`；`>=1` 时 `min(5, 2 + 记录数)`；即 1→3、2→4、≥3→5 | 强调核心半径内是否有 C 类可落点 |
+| 可评估性 | 不再做命中统计 | 固定 `5` 分 | 所有目标点统一满分，用于按权重计算总分 |
+| 进入性 | `entry_clue = hits` 中 `group in ("community_service","residence_property")` 的记录数 | `0→1`；`>=1` 时 `min(5, 3 + min(记录数,2))`；即 1→4、≥2→5 | 对应物业/居委等治理主体入口线索 |
+
+硬淘汰判定（命中任一条即淘汰）：
+- A 类全缺失：`len(present["A"]) == 0`
+- 边界极不清晰：`边界清晰 <= 1`
+- 进入性线索缺失：`进入性 == 1`
+
+总分计算（当前实现）：
+- 原始总分：按权重加权，`TOTAL = Σ(维度分 × 维度权重)`，范围 `1.0–5.0`。
+- 最终总分：若存在任一硬淘汰原因，`TOTAL = 0`；否则 `TOTAL = 原始总分（加权）`。
+- 报表中 `淘汰标记=是` 的条件即“存在淘汰原因”。
 
 ## MCP 模式提示
 若已在 mcprouter 部署高德 MCP Server，将 `AMAP_MODE=mcp`，并用 `--mcp-base` 指向服务地址；其余逻辑与直连一致，可降低本地暴露 Key 的风险。
